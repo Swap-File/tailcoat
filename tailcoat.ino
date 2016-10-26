@@ -53,8 +53,9 @@ uint8_t led_direction = LEDS_UP;
 
 #define ROOMBA_OFF 0
 #define ROOMBA_START 1
-#define ROOMBA_ON 2
+#define ROOMBA_ON 128
 uint8_t roomba_mode = ROOMBA_OFF;
+uint32_t roomba_bootup_timer = 0;
 
 //status stuff for cpu usage
 uint32_t fps_time = 0;
@@ -176,7 +177,7 @@ void loop() {
       if (roomba_mode == ROOMBA_OFF) {
 
 #ifdef ROOMBA_OUTPUT
-        stopromba(); //stop motors but dont shut off
+        roomba_move(0, 0); //stop motors but dont shut off
 #endif
 
       }
@@ -333,15 +334,14 @@ void loop() {
 #endif
         if (tap_count == 1) {
           roomba_mode = ROOMBA_OFF;
-           special_mode = false;
+          special_mode = false;
         }
         else if (tap_count == 3) {
           roomba_mode = ROOMBA_START;
-          wakeup();
           special_mode = false;
-          roomba_mode = ROOMBA_ON;
+
         } else  if (tap_count == 4) {
-           byte specialmode[2] = {136, 4};
+          byte specialmode[2] = {136, 4};
           Serial.write(specialmode, 2);
           special_mode = true;
         } else  if (tap_count == 5) {
@@ -353,6 +353,11 @@ void loop() {
         tap_count = 0;
       }
     }
+
+
+    wakeup();
+
+
 #ifdef MPU_DEBUG
     Serial.print(current_acceleration);
     Serial.print("\t");
@@ -371,19 +376,7 @@ void loop() {
     //roomba motion calculations
 
     if (roomba_mode == ROOMBA_ON && special_mode == false) {
-      if (abs(zangle) < 50) { //do normal turning for low tilt angles
-        if ( yangle > 20) {
-          Back();
-        } else if ( yangle < -20) {
-          Fwd();
-        } else {
-          stopromba();
-        }
-      } else if (zangle > 50) {  //high tilt means turn in place
-        TurnLeft();
-      } else if (zangle < -50) {
-        TurnRight();
-      }
+      roomba_move(yangle, zangle);
     }
 
     if (current_acceleration > max_acceleration)   max_acceleration = current_acceleration;
@@ -406,10 +399,24 @@ void loop() {
 
 inline void led_render_engine() {
   int led2counter = 0;
-  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) blur_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
+
+  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) {
+    if (tap_counted) {
+      actual_leds[led2counter++] = CRGB(255,255,255);
+    } else {
+      blur_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
+    }
+  }
   for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blur_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
   for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blur_and_output((i +  right_index) % CHEST_NUM_LEDS, led2counter++);
-  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) blur_and_output((i +  right_index) % CHEST_NUM_LEDS, led2counter++);
+
+  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) {
+    if (tap_counted) {
+      actual_leds[led2counter++]  = CRGB(255,255,255);
+    } else {
+      blur_and_output((i +  right_index)  % CHEST_NUM_LEDS, led2counter++);
+    }
+  }
   FastLED.show();
 }
 
@@ -427,43 +434,87 @@ void blur_and_output( uint8_t in, uint8_t out) {
 }
 
 
-void TurnRight() {
-  byte Rright[6] = {137, 0x01, 0xf4, 0, 1};
-  Serial.write(Rright, 6);
+void roomba_move(int16_t yangle, int16_t zangle) {
+
+  int16_t velocity = 0;
+  int16_t turning = 0x8000; //special case for straight
+
+  if ( yangle > 20) {
+    velocity = map(yangle, 20, 40, 0, -500);
+  } else if ( yangle < -20) {
+    velocity = map(yangle, -20, -40, 0, 500);
+  }
+
+  if ( zangle > 40) {
+    turning = 0xFFFF;//special case for turn in place
+    velocity = 500;
+  } else if ( zangle < -40) {
+    turning = 0x0001;//special case for turn in place
+    velocity = 500;
+  } else if ( zangle > 20) {
+    turning =  map(zangle, 20, 40, -500, -1);
+    if (turning > -1) turning = -1;
+
+
+  } else if ( zangle < -20) {
+    turning = map(zangle, -20, -40, 500, 1);
+    if (turning < 1) turning = 1;
+  }
+
+  velocity = constrain(velocity, -500, 500);
+
+  Serial.write(137);
+  Serial.write( (byte)((velocity >> 8) & 0xFF) );
+  Serial.write( (byte)((velocity ) & 0xFF) );
+
+  Serial.write( (byte)((turning >> 8) & 0xFF) );
+  Serial.write( (byte)((turning ) & 0xFF) );
+
 }
 
-void TurnLeft() {
-  byte Rleft[6] = {137, 0x01, 0xf4, 255, 255};
-  Serial.write(Rleft, 6);
-}
-void Fwd() {
-  byte Rfwd[6] = {137, 0x01, 0xf4, 0x80, 0x00}  ;
-  Serial.write(Rfwd, 6);
-}
-void Back() {
-  byte Rback[6] = {137, 0xfe, 0x0c, 0x80, 0x00};
-  Serial.write(Rback, 6);
-}
+void wakeup() {  //no delay wakeup
+  //ROOMBA_START == 1
+  //ROOMBA_ON == 128
+  if (roomba_mode == 1) {
+    pinMode(5, INPUT);
+    digitalWrite(5, 0);
+    pinMode(5, OUTPUT);
+    digitalWrite(5, 0);
+    roomba_bootup_timer = millis();
+    roomba_mode++;
+  }
 
-void stopromba() {
-  byte Rstop[6] = {137, 0, 0, 0, 0}; //stopping the drive motors is just a "zero" speed selection
-  Serial.write(Rstop, 6);
-}
-void wakeup() {
-  pinMode(5, INPUT);
-  digitalWrite(5, 0);
-  pinMode(5, OUTPUT);
-  digitalWrite(5, 0);
-  delay(1000);
-  pinMode(5, INPUT);
-  delay(100);
-  Serial.write(128);  //start (goes to Passive)
-  delay(20);  //delay 20 milliseconds after state change
-  Serial.write(130);  //Command mode - goes to safe
-  delay(20);  //delay 20 milliseconds after state change
+  else if (roomba_mode == 2 && millis() - roomba_bootup_timer > 1000) {
+    pinMode(5, INPUT);
+    roomba_bootup_timer = millis();
+    roomba_mode++;
+  }
+
+
+  else if (roomba_mode == 3 && millis() - roomba_bootup_timer > 20) {
+    Serial.write(128);  //start (goes to Passive)
+    roomba_bootup_timer = millis();
+    roomba_mode++;
+  }
+
+  else if (roomba_mode == 4 && millis() - roomba_bootup_timer > 20) {
+    Serial.write(128);  //start (goes to Passive)
+    roomba_bootup_timer = millis();
+    roomba_mode++;
+  }
+
+
+  else  if (roomba_mode == 5 && millis() - roomba_bootup_timer > 20) {
+    Serial.write(130);  //start (goes to Passive)
+    roomba_bootup_timer = millis();
+    roomba_mode++;
+  }
+
+  else if (roomba_mode == 6 && millis() - roomba_bootup_timer > 20) {
+    roomba_mode = ROOMBA_ON;
+  }
 
 #ifdef debug
   Serial.println("Roomba Initialized (start, command)");
 #endif
 }
-
