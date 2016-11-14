@@ -12,14 +12,15 @@ FASTLED_USING_NAMESPACE
 #define INTERRUPT_PIN 2
 #define DATA_PIN    11
 #define CLK_PIN   13
-#define CHEST_NUM_LEDS 60
+#define CHEST_NUM_LEDS 59
 #define WRIST_NUM_LEDS 16
-#define TOTAL_NUM_LEDS 2 * CHEST_NUM_LEDS + 2 * WRIST_NUM_LEDS
+#define TOTAL_NUM_LEDS 165
 #define LED_TYPE    LPD8806
-#define COLOR_ORDER GRB
+#define COLOR_ORDER BRG
 CRGB unique_leds[CHEST_NUM_LEDS];
 CRGB actual_leds[TOTAL_NUM_LEDS];
-#define BRIGHTNESS          128
+
+uint16_t generator_timer = 200;
 
 // Arduino Wire library is required if I2Cdev I2CDEV_ARDUINO_WIRE implementation
 // is used in I2Cdev.h
@@ -29,7 +30,7 @@ CRGB actual_leds[TOTAL_NUM_LEDS];
 
 MPU6050 mpu;
 
-uint8_t blur_rate = 5;
+#define BLUR_RATE 5
 
 int8_t left_index = 0;
 int8_t right_index = 0;
@@ -45,14 +46,20 @@ bool tap_counted = false;
 
 uint8_t gHue = 0; // rotating "base color" used by many of the patterns
 
+#define JACKET_OFF 0
+#define JACKET_ON 1
+#define JACKET_MOTION 2
+uint8_t jacket_mode = JACKET_MOTION;
+
 #define LEDS_CW 0
 #define LEDS_CCW 1
 #define LEDS_UP 2
 #define LEDS_DOWN 3
 uint8_t led_direction = LEDS_UP;
 
-#define ROOMBA_OFF 0
-#define ROOMBA_START 1
+#define ROOMBA_IDLE 0
+#define ROOMBA_OFF 1
+#define ROOMBA_START 2
 #define ROOMBA_ON 128
 uint8_t roomba_mode = ROOMBA_OFF;
 uint32_t roomba_bootup_timer = 0;
@@ -62,6 +69,10 @@ uint32_t fps_time = 0;
 uint32_t idle_microseconds = 0;
 uint8_t cpu_usage = 0;
 
+int16_t shift_update_speed = 100;
+bool left_off = true;
+bool right_off = true;
+uint32_t fade_timer = 0;
 
 // MPU control/status vars
 bool dmpReady = false;  // set true if DMP init was successful
@@ -147,17 +158,10 @@ void setup() {
   }
 
   FastLED.addLeds<LED_TYPE, DATA_PIN, CLK_PIN, COLOR_ORDER>(actual_leds, TOTAL_NUM_LEDS).setCorrection(TypicalLEDStrip);
-  FastLED.setBrightness(0);
+  FastLED.setBrightness(255);
 
 }
 
-int16_t shift_update_speed = 100;
-bool special_mode = false;
-bool left_off = true;
-bool right_off = true;
-
-uint8_t current_brightness = 0;
-uint32_t max_acceleration = 0;
 void loop() {
   // if programming failed, don't try to do anything
   if (!dmpReady) return;
@@ -174,13 +178,11 @@ void loop() {
       Serial.println(cpu_usage);
 #endif
 
-      if (roomba_mode == ROOMBA_OFF) {
 
 #ifdef ROOMBA_OUTPUT
-        roomba_move(0, 0); //stop motors but dont shut off
+      if (roomba_mode == ROOMBA_OFF)  roomba_move(0, 0); //stop motors but dont shut off
 #endif
 
-      }
 
       idle_microseconds = 0;
       fps_time = micros();
@@ -188,11 +190,11 @@ void loop() {
 
 
     //slowly rotate through demo modes
-    if (millis() - mode_swap_timer > 10000) {
-      led_direction++;
-      if (led_direction > 3) led_direction = 0;
-      mode_swap_timer = millis();
-    }
+    //  if (millis() - mode_swap_timer > 10000) {
+    //   led_direction++;
+    //    if (led_direction > 3) led_direction = 0;
+    //    mode_swap_timer = millis();
+    //  }
 
     //force scrolling other side quickly
     if (millis() - shift_update_time > shift_update_speed) {
@@ -219,10 +221,13 @@ void loop() {
       shift_update_time = millis();
     }
     //spawn more dots
-    if (millis() - last_effect_time > 200) {
+    if (millis() - fade_timer > 200 ) {
       fadeToBlackBy( unique_leds, CHEST_NUM_LEDS, 10);
-      int pos = random16(CHEST_NUM_LEDS);
-      unique_leds[pos] += CHSV( gHue + random8(64), 200, 255);
+      fade_timer = millis();
+    }
+    if (millis() - last_effect_time > generator_timer && jacket_mode != JACKET_OFF && generator_timer < 2000) {
+
+      add_pixel();
       last_effect_time = millis();
     }
 
@@ -315,12 +320,19 @@ void loop() {
     }
 
     //some kind of slow dim thing, figure it later
-    uint32_t current_acceleration = abs(aaReal.z) + abs(aaReal.y) + abs(aaReal.x);
+    uint32_t current_acceleration = abs(aaReal.z) + abs( aaReal.y ) + abs(aaReal.x );
 
-    if (current_acceleration > 15000 && tap_counted == false && millis() - tap_time > 300) {
+#ifdef GENERAL_DEBUG
+    Serial.println();
+    Serial.println(current_acceleration);
+#endif
+
+    if (current_acceleration > 10000 && tap_counted == false && millis() - tap_time > 300) {
       tap_count++;
       tap_time = millis();
       tap_counted = true;
+      set_wrist_color( CRGB::White );  //white pop for hit detect
+      if (jacket_mode == JACKET_MOTION) jumpstart(16);
     }
     if (current_acceleration < 4000) {
       tap_counted = false;
@@ -328,35 +340,50 @@ void loop() {
 
     if (tap_count > 0) {
       if (millis() - tap_time > 1000) {
+
 #ifdef GENERAL_DEBUG
         Serial.print("TAP! ");
         Serial.println(tap_count);
 #endif
+
         if (tap_count == 1) {
+          set_wrist_color(CRGB::Purple);
+          gHue = 192;
+          if (jacket_mode != JACKET_OFF) jumpstart(8);
+        }
+        else if (tap_count == 2) {
+
+          if (jacket_mode == JACKET_OFF) jacket_mode = JACKET_MOTION;
+          set_wrist_color(CRGB::Blue);
+          gHue = 160;
+          jumpstart(8);
+        }
+        else if (tap_count == 3) { //roomba drive mode
+          jacket_mode = JACKET_ON;
+          roomba_mode = ROOMBA_START; //this will initiate the roomba bootup sequence and then kick into ROOMBA_ON
+          set_wrist_color(CRGB::Lime);
+          gHue = 96;
+          jumpstart(8);
+        } else  if (tap_count == 4) { //roomba spot clean
+          jacket_mode = JACKET_MOTION;
+          roomba_mode = ROOMBA_IDLE;//dont send the off command, let it keep cleaning
+          byte specialmode[2] = {136, 2};  //spot clean demo
+          Serial.write(specialmode, 2);
+          set_wrist_color( CRGB::Yellow);
+          gHue = 64;
+          jumpstart(8);
+        } else   if (tap_count == 5) {
+          jacket_mode = JACKET_OFF;
           roomba_mode = ROOMBA_OFF;
-          special_mode = false;
+          for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++)  unique_leds[i] = CRGB(0, 0, 0);
+          set_wrist_color( CRGB::Red );
+          gHue = 230;
         }
-        else if (tap_count == 3) {
-          roomba_mode = ROOMBA_START;
-          special_mode = false;
-
-        } else  if (tap_count == 4) {
-          byte specialmode[2] = {136, 4};
-          Serial.write(specialmode, 2);
-          special_mode = true;
-        } else  if (tap_count == 5) {
-          byte specialmode[2] = {136, 2};
-          Serial.write(specialmode, 2);
-          special_mode = true;
-        }
-
         tap_count = 0;
       }
     }
 
-
     wakeup();
-
 
 #ifdef MPU_DEBUG
     Serial.print(current_acceleration);
@@ -374,68 +401,57 @@ void loop() {
 #endif
 
     //roomba motion calculations
+    if (roomba_mode == ROOMBA_OFF || roomba_mode == ROOMBA_ON )  roomba_move(yangle, zangle);
 
-    if (roomba_mode == ROOMBA_ON && special_mode == false) {
-      roomba_move(yangle, zangle);
+    //   if (tap_counted) current_brightness = 255;
+
+    if (jacket_mode == JACKET_ON)    {
+
+      generator_timer = 200;
     }
+    else if (jacket_mode == JACKET_MOTION) {
 
-    if (current_acceleration > max_acceleration)   max_acceleration = current_acceleration;
-
-    max_acceleration = max_acceleration * .99;
-
-    if (max_acceleration > 10000) current_brightness = 255;
-    else current_brightness = qsub8(current_brightness, 1);
-
-    //Serial.println(current_brightness);
-    FastLED.setBrightness(current_brightness);
-
-
+      if (millis() - tap_time > 2000) {
+        if (generator_timer < 4000) generator_timer += 100;
+      }
+    }
 
     //update LEDS at 100hz, use the interrupt from the MPU as the timer
     led_render_engine();
   }
 }
 
+void jumpstart(uint8_t level) {
+  for (uint8_t i = 0; i < level; i++) {
+    fadeToBlackBy( unique_leds, CHEST_NUM_LEDS, 10);
+    add_pixel();
+  }
+}
+
+void add_pixel() {
+  int pos = random16(CHEST_NUM_LEDS);
+  unique_leds[pos] += CHSV( gHue + random8(64), 200, 255);
+
+}
 
 inline void led_render_engine() {
-  int led2counter = 0;
-
-  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) {
-    if (tap_counted) {
-      actual_leds[led2counter++] = CRGB(255,255,255);
-    } else {
-      blur_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
-    }
-  }
-  for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blur_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
-  for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blur_and_output((i +  right_index) % CHEST_NUM_LEDS, led2counter++);
-
-  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) {
-    if (tap_counted) {
-      actual_leds[led2counter++]  = CRGB(255,255,255);
-    } else {
-      blur_and_output((i +  right_index)  % CHEST_NUM_LEDS, led2counter++);
-    }
-  }
+  uint8_t led2counter = 0;
+  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) blend_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
+  for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blend_and_output((i +  left_index)  % CHEST_NUM_LEDS, led2counter++);
+  for (uint8_t i = 0; i < CHEST_NUM_LEDS; i++) blend_and_output((i +  right_index) % CHEST_NUM_LEDS, led2counter++);
+  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++) blend_and_output((i +  right_index) % CHEST_NUM_LEDS, led2counter++);
   FastLED.show();
 }
 
-void blur_and_output( uint8_t in, uint8_t out) {
-
-  if (actual_leds[out].r < unique_leds[in].r) actual_leds[out].r = min(qadd8(actual_leds[out].r, blur_rate), unique_leds[in].r);
-  else if (actual_leds[out].r > unique_leds[in].r) actual_leds[out].r = max(qsub8(actual_leds[out].r, blur_rate), unique_leds[in].r);
-
-  if (actual_leds[out].g < unique_leds[in].g) actual_leds[out].g = min(qadd8(actual_leds[out].g, blur_rate), unique_leds[in].g);
-  else if (actual_leds[out].g > unique_leds[in].g) actual_leds[out].g = max(qsub8(actual_leds[out].g, blur_rate), unique_leds[in].g);
-
-  if (actual_leds[out].b < unique_leds[in].b) actual_leds[out].b = min(qadd8(actual_leds[out].b, blur_rate), unique_leds[in].b);
-  else if (actual_leds[out].b > unique_leds[in].b) actual_leds[out].b = max(qsub8(actual_leds[out].b, blur_rate), unique_leds[in].b);
-
+inline void set_wrist_color(CRGB color) {
+  for (uint8_t i = 0; i < WRIST_NUM_LEDS; i++)   actual_leds[i] = actual_leds[i + 150 - 16] = color;
 }
 
+inline void blend_and_output( uint8_t in, uint8_t out) {
+  actual_leds[out] = blend(actual_leds[out], unique_leds[in], BLUR_RATE);
+}
 
-void roomba_move(int16_t yangle, int16_t zangle) {
-
+inline void roomba_move(int16_t yangle, int16_t zangle) {
   int16_t velocity = 0;
   int16_t turning = 0x8000; //special case for straight
 
@@ -454,8 +470,6 @@ void roomba_move(int16_t yangle, int16_t zangle) {
   } else if ( zangle > 20) {
     turning =  map(zangle, 20, 40, -500, -1);
     if (turning > -1) turning = -1;
-
-
   } else if ( zangle < -20) {
     turning = map(zangle, -20, -40, 500, 1);
     if (turning < 1) turning = 1;
@@ -464,18 +478,16 @@ void roomba_move(int16_t yangle, int16_t zangle) {
   velocity = constrain(velocity, -500, 500);
 
   Serial.write(137);
-  Serial.write( (byte)((velocity >> 8) & 0xFF) );
-  Serial.write( (byte)((velocity ) & 0xFF) );
-
-  Serial.write( (byte)((turning >> 8) & 0xFF) );
-  Serial.write( (byte)((turning ) & 0xFF) );
-
+  Serial.write((byte)((velocity >> 8) & 0xFF));
+  Serial.write((byte)((velocity) & 0xFF));
+  Serial.write((byte)((turning >> 8) & 0xFF));
+  Serial.write((byte)((turning) & 0xFF));
 }
 
-void wakeup() {  //no delay wakeup
+inline void wakeup() {  //no delay wakeup
   //ROOMBA_START == 1
   //ROOMBA_ON == 128
-  if (roomba_mode == 1) {
+  if (roomba_mode == ROOMBA_START) {
     pinMode(5, INPUT);
     digitalWrite(5, 0);
     pinMode(5, OUTPUT);
@@ -483,38 +495,32 @@ void wakeup() {  //no delay wakeup
     roomba_bootup_timer = millis();
     roomba_mode++;
   }
-
-  else if (roomba_mode == 2 && millis() - roomba_bootup_timer > 1000) {
+  else if ((roomba_mode == (ROOMBA_START + 1)) && (( millis() - roomba_bootup_timer ) > 1000)) {
     pinMode(5, INPUT);
     roomba_bootup_timer = millis();
     roomba_mode++;
   }
-
-
-  else if (roomba_mode == 3 && millis() - roomba_bootup_timer > 20) {
-    Serial.write(128);  //start (goes to Passive)
+  else if ((roomba_mode == (ROOMBA_START + 2)) && ( (millis() - roomba_bootup_timer) > 20)) {
+    Serial.write(128);
     roomba_bootup_timer = millis();
     roomba_mode++;
   }
-
-  else if (roomba_mode == 4 && millis() - roomba_bootup_timer > 20) {
-    Serial.write(128);  //start (goes to Passive)
+  else if ((roomba_mode == ( ROOMBA_START + 3)) && ((millis() - roomba_bootup_timer) > 20)) {
+    Serial.write(128);
     roomba_bootup_timer = millis();
     roomba_mode++;
   }
-
-
-  else  if (roomba_mode == 5 && millis() - roomba_bootup_timer > 20) {
-    Serial.write(130);  //start (goes to Passive)
+  else if ((roomba_mode == (ROOMBA_START + 4)) && (( millis() - roomba_bootup_timer) > 20)) {
+    Serial.write(130);
     roomba_bootup_timer = millis();
     roomba_mode++;
   }
-
-  else if (roomba_mode == 6 && millis() - roomba_bootup_timer > 20) {
+  else if ((roomba_mode == (ROOMBA_START + 5)) && ((millis() - roomba_bootup_timer) > 20)) {
     roomba_mode = ROOMBA_ON;
   }
 
 #ifdef debug
   Serial.println("Roomba Initialized (start, command)");
 #endif
+
 }
